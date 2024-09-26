@@ -20,24 +20,8 @@ except ImportError:
     # If not tqdm is not available, provide a mock version of it
     def tqdm(x): return x
 
-from inception import InceptionV3
+from .inception import InceptionV3
 
-parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
-parser.add_argument('path', type=str, nargs=1,
-                    help=('Path to the generated images or '
-                          'to .npz statistic files'))
-parser.add_argument('--batch-size', type=int, default=50,
-                    help='Batch size to use')
-parser.add_argument('--dims', type=int, default=2048,
-                    choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
-                    help=('Dimensionality of Inception features to use. '
-                          'By default, uses pool3 features'))
-parser.add_argument('-c', '--gpu', default='', type=str,
-                    help='GPU to use (leave blank for CPU only)')
-parser.add_argument('--pca_path', type=str, default=None)
-# "/mnt/blob/code/image-judge/gaussian/pca_stat/pca_all_95.pkl"
-parser.add_argument('--gmm_path', type=str, default="/mnt/blob/code/image-judge/gaussian/pca_stat/stat_cat/act95_7")
-parser.add_argument('--output_file', type=str, default="/mnt/blob/datasets/generation_results/score_results/try_out.txt")
 
 def imread(filename):
     return np.asarray(Image.open(filename).convert('RGB'), dtype=np.uint8)[..., :3]
@@ -59,7 +43,6 @@ def get_activations(files, model, batch_size, dims, cuda, verbose, pca_path, gmm
     n_batches = len(files) // batch_size
     n_used_imgs = n_batches * batch_size
 
-    pred_arr = np.empty((n_used_imgs, dims))
 
     pca_gmm_path = gmm_path
     pca_gmm = pickle.load(open(gmm_path, "rb"))
@@ -101,6 +84,75 @@ def get_activations(files, model, batch_size, dims, cuda, verbose, pca_path, gmm
                 f.write("\n")
 
     return pred_arr
+
+
+import pickle
+
+class RenameUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        renamed_module = module
+        if module == "sklearn.mixture.gaussian_mixture":
+            renamed_module = "sklearn.mixture._gaussian_mixture"
+
+        return super(RenameUnpickler, self).find_class(renamed_module, name)
+
+
+def renamed_load(file_obj):
+    return RenameUnpickler(file_obj).load()
+
+def load_models(inception_dims, useCuda, pca_path, gmm_path):
+    block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_dims]
+    model = InceptionV3([block_idx])
+    if useCuda:
+        model.cuda()
+
+    
+    pca_gmm_path = gmm_path
+    #pca_gmm = pickle.load(open(gmm_path, "rb"))
+    pca_gmm = renamed_load(open(gmm_path, "rb"))
+    
+    if pca_path != None:
+        pca = pickle.load(open(pca_path, "rb"))
+    else:
+        pca = None
+        
+    return model, pca, pca_gmm
+
+def get_activation_preloaded_model(files, model, pca_gmm, pca=None, inception_dims=2048, useCuda=True, read_files=True):
+    if not isinstance(files, list):
+        files = [files]
+        singleFile = True
+    else:
+        singleFile = False
+
+    model.eval()
+    batch_size = len(files)
+
+    if read_files:
+        images = np.array([imread(str(f)).astype(np.float32) for f in files])
+    else:
+        images = np.array(files).astype(np.float32)
+
+    # Reshape to (n_images, 3, height, width)
+    #print(images.shape)
+    images = images.transpose((0, 3, 1, 2))
+    images /= 255
+
+    batch = torch.from_numpy(images).type(torch.FloatTensor)
+    if useCuda:
+        batch = batch.cuda()
+    pred = model(batch)[0]
+
+    if pca != None:
+        pred = pca.transform(pred.cpu()[:,:,0,0]) 
+        prop = pca_gmm.score_samples(pred)
+    else:
+        prop = pca_gmm.score_samples(pred[:,:,0,0].cpu().numpy())    
+
+    if singleFile:
+        prop = prop[0]
+    
+    return prop
 
 
 def calculate_activation_statistics(files, model, batch_size, dims, cuda, pca_path, gmm_path, output_file):
@@ -146,6 +198,23 @@ def calculate_fid_given_paths(paths, batch_size, cuda, dims, pca_path, gmm_path,
 
 
 if __name__ == '__main__':
+        
+    parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('path', type=str, nargs=1,
+                        help=('Path to the generated images or '
+                              'to .npz statistic files'))
+    parser.add_argument('--batch-size', type=int, default=50,
+                        help='Batch size to use')
+    parser.add_argument('--dims', type=int, default=2048,
+                        choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
+                        help=('Dimensionality of Inception features to use. '
+                              'By default, uses pool3 features'))
+    parser.add_argument('-c', '--gpu', default='', type=str,
+                        help='GPU to use (leave blank for CPU only)')
+    parser.add_argument('--pca_path', type=str, default=None)
+    # "/mnt/blob/code/image-judge/gaussian/pca_stat/pca_all_95.pkl"
+    parser.add_argument('--gmm_path', type=str, default="/mnt/blob/code/image-judge/gaussian/pca_stat/stat_cat/act95_7")
+    parser.add_argument('--output_file', type=str, default="/mnt/blob/datasets/generation_results/score_results/try_out.txt")
     args = parser.parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
